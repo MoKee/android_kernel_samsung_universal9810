@@ -539,7 +539,7 @@ static int __abox_process_ipc(struct device *dev, struct abox_data *data,
 
 	void __iomem *tx_base = data->sram_base + data->ipc_tx_offset;
 	void __iomem *tx_ack = data->sram_base + data->ipc_tx_ack_offset;
-	int ret, i;
+	int ret = 0, i;
 
 	dev_dbg(dev, "%s(%d, %d, %d)\n", __func__, hw_irq,
 			msg->ipcid, msg->msg.system.msgtype);
@@ -1493,26 +1493,6 @@ static int abox_audio_mode_put_ipc(struct device *dev, enum audio_mode mode)
 	struct IPC_SYSTEM_MSG *system_msg = &msg.msg.system;
 
 	dev_dbg(dev, "%s(%d)\n", __func__, mode);
-
-	if (IS_ENABLED(CONFIG_SOC_EXYNOS9810)) {
-		static const unsigned int BIG_FREQ = 1248000;
-		static const unsigned int LIT_FREQ = 1274000;
-
-		switch (mode) {
-		case MODE_IN_COMMUNICATION:
-			abox_request_big_freq(dev, data,
-					(void *)DEFAULT_BIG_FREQ_ID, BIG_FREQ);
-			abox_request_lit_freq(dev, data,
-					(void *)DEFAULT_LIT_FREQ_ID, LIT_FREQ);
-			break;
-		default:
-			abox_request_big_freq(dev, data,
-					(void *)DEFAULT_BIG_FREQ_ID, 0);
-			abox_request_lit_freq(dev, data,
-					(void *)DEFAULT_LIT_FREQ_ID, 0);
-			break;
-		}
-	}
 
 	msg.ipcid = IPC_SYSTEM;
 	system_msg->msgtype = ABOX_SET_MODE;
@@ -3079,6 +3059,10 @@ int abox_hw_params_fixup_helper(struct snd_soc_pcm_runtime *rtd,
 	if (dai->driver->symmetric_rates && dai->rate && dai->rate != rate)
 		rate = dai->rate;
 
+	abox_set_sif_format(data, msg_format, format);
+	abox_set_sif_channels(data, msg_format, channels);
+	abox_set_sif_rate(data, msg_rate, rate);
+
 	dev_dbg(dev, "%s: set to %u bit, %u channel, %uHz\n", __func__,
 			width, channels, rate);
 unlock:
@@ -3330,13 +3314,20 @@ static void abox_change_cpu_gear(struct device *dev, struct abox_data *data)
 	for (request = data->cpu_gear_requests;
 			request - data->cpu_gear_requests <
 			ARRAY_SIZE(data->cpu_gear_requests)
-			&& request->id;
+			&& READ_ONCE(request->id);
 			request++) {
-		if (gear > request->value)
-			gear = request->value;
+		unsigned int value = READ_ONCE(request->value);
+
+		if (gear > value)
+			gear = value;
 
 		dev_dbg(dev, "id=%p, value=%u, gear=%u\n", request->id,
 				request->value, gear);
+	}
+
+	if (gear < 1) {
+		dev_warn(dev, "%s: gear=%d\n", __func__, gear);
+		gear = 1;
 	}
 
 	if ((data->cpu_gear >= ABOX_CPU_GEAR_MIN) &&
@@ -3394,9 +3385,8 @@ int abox_request_cpu_gear(struct device *dev, struct abox_data *data,
 
 	old_id = request->id;
 	old_gear = request->value;
-	request->value = gear;
-	wmb(); /* value is read after id in reading function */
-	request->id = id;
+	WRITE_ONCE(request->value, gear);
+	WRITE_ONCE(request->id, id);
 
 	if (request - data->cpu_gear_requests >=
 			ARRAY_SIZE(data->cpu_gear_requests)) {
@@ -4467,7 +4457,7 @@ static void abox_system_ipc_handler(struct device *dev,
 		break;
 	case ABOX_CHANGE_GEAR:
 		abox_request_cpu_gear(dev, data,
-				(void *)(long)system_msg->param2,
+				(void *)(unsigned long)system_msg->param2,
 				system_msg->param1);
 		break;
 	case ABOX_END_L2C_CONTROL:
@@ -4476,7 +4466,7 @@ static void abox_system_ipc_handler(struct device *dev,
 		break;
 	case ABOX_REQUEST_L2C:
 	{
-		void *id = (void *)(long)system_msg->param2;
+		void *id = (void *)(unsigned long)system_msg->param2;
 		bool on = !!system_msg->param1;
 
 		abox_request_l2c(dev, data, id, on);
@@ -4487,14 +4477,12 @@ static void abox_system_ipc_handler(struct device *dev,
 		default:
 			/* fall through */
 		case 0:
-			abox_request_mif_freq(dev, data,
-					(void *)(long)system_msg->param3,
-					system_msg->param1);
+			abox_request_mif_freq(dev, data, (void *)(unsigned long)
+					system_msg->param3, system_msg->param1);
 			break;
 		case 1:
-			abox_request_int_freq(dev, data,
-					(void *)(long)system_msg->param3,
-					system_msg->param1);
+			abox_request_int_freq(dev, data, (void *)(unsigned long)
+					system_msg->param3, system_msg->param1);
 			break;
 		}
 		break;
@@ -5676,12 +5664,17 @@ static int abox_pm_notifier(struct notifier_block *nb,
 
 			pm_runtime_barrier(dev);
 			state = data->calliope_state;
-			if (state == CALLIOPE_ENABLING) {
+			switch (state) {
+			case CALLIOPE_ENABLING:
 				dev_info(dev, "calliope state: %d\n", state);
 				return NOTIFY_BAD;
+			case CALLIOPE_ENABLED:
+				/* clear cpu gears to abox power off */
+				abox_clear_cpu_gear_requests(dev, data);
+				break;
+			default:
+				break;
 			}
-			/* clear cpu gears to abox power off */
-			abox_clear_cpu_gear_requests(dev, data);
 			abox_cpu_gear_barrier(data);
 			flush_workqueue(data->ipc_workqueue);
 			ret = pm_runtime_suspend(dev);
@@ -6079,7 +6072,7 @@ static int samsung_abox_probe(struct platform_device *pdev)
 			&abox_regmap_config);
 
 	pm_runtime_enable(dev);
-	pm_runtime_set_autosuspend_delay(dev, 1);
+	pm_runtime_set_autosuspend_delay(dev, 500);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_get(dev);
 

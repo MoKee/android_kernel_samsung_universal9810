@@ -24,7 +24,7 @@
  *
  * <<Broadcom-WL-IPTag/Open:>>
  *
- * $Id: dhd_pcie_linux.c 740051 2018-01-10 13:56:33Z $
+ * $Id: dhd_pcie_linux.c 776907 2018-08-16 06:05:35Z $
  */
 
 /* include files */
@@ -930,6 +930,15 @@ int dhdpcie_pci_suspend_resume(dhd_bus_t *bus, bool state)
 		rc = dhdpcie_resume_host_dev(bus);
 		if (!rc) {
 			rc = dhdpcie_resume_dev(dev);
+			if (MULTIBP_ENAB(bus->sih) && (bus->sih->buscorerev >= 66)) {
+				/* reinit CTO configuration
+				 * because cfg space got reset at D3 (PERST)
+				 */
+				dhdpcie_cto_init(bus, bus->cto_enable);
+			}
+			if (bus->sih->buscorerev == 66) {
+				dhdpcie_ssreset_dis_enum_rst(bus);
+			}
 #if !defined(BCMPCIE_OOB_HOST_WAKE)
 			dhdpcie_pme_active(bus->osh, state);
 #endif // endif
@@ -1348,6 +1357,37 @@ int dhdpcie_scan_resource(dhdpcie_info_t *dhdpcie_info)
 
 }
 
+void dhdpcie_dump_resource(dhd_bus_t *bus)
+{
+	dhdpcie_info_t *pch;
+
+	if (bus == NULL) {
+		DHD_ERROR(("%s: bus is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	if (bus->dev == NULL) {
+		DHD_ERROR(("%s: bus->dev is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	pch = pci_get_drvdata(bus->dev);
+	if (pch == NULL) {
+		DHD_ERROR(("%s: pch is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	/* BAR0 */
+	DHD_ERROR(("%s: BAR0(VA): 0x%pK, BAR0(PA): "PRINTF_RESOURCE", SIZE: %d\n",
+		__FUNCTION__, pch->regs, pci_resource_start(bus->dev, 0),
+		DONGLE_REG_MAP_SIZE));
+
+	/* BAR1 */
+	DHD_ERROR(("%s: BAR1(VA): 0x%pK, BAR1(PA): "PRINTF_RESOURCE", SIZE: %d\n",
+		__FUNCTION__, pch->tcm, pci_resource_start(bus->dev, 2),
+		pch->tcm_size));
+}
+
 #ifdef SUPPORT_LINKDOWN_RECOVERY
 #if defined(CONFIG_ARCH_MSM) || (defined(EXYNOS_PCIE_LINKDOWN_RECOVERY) && \
 	(defined(CONFIG_SOC_EXYNOS8890) || defined(CONFIG_SOC_EXYNOS8895) || \
@@ -1398,6 +1438,7 @@ int dhdpcie_init(struct pci_dev *pdev)
 #ifdef USE_SMMU_ARCH_MSM
 	dhdpcie_smmu_info_t	*dhdpcie_smmu_info = NULL;
 #endif /* USE_SMMU_ARCH_MSM */
+	int ret = 0;
 
 	do {
 		/* osl attach */
@@ -1482,14 +1523,15 @@ int dhdpcie_init(struct pci_dev *pdev)
 		}
 
 		/* Bus initialization */
-		bus = dhdpcie_bus_attach(osh, dhdpcie_info->regs, dhdpcie_info->tcm, pdev);
-		if (!bus) {
+		ret = dhdpcie_bus_attach(osh, &bus, dhdpcie_info->regs, dhdpcie_info->tcm, pdev);
+		if (ret != BCME_OK) {
 			DHD_ERROR(("%s:dhdpcie_bus_attach() failed\n", __FUNCTION__));
 			break;
 		}
 
 		dhdpcie_info->bus = bus;
 		bus->is_linkdown = 0;
+		bus->no_bus_init = FALSE;
 
 		/* Get RC Device Handle */
 		bus->rc_dev = pci_get_device(PCIE_RC_VENDOR_ID, PCIE_RC_DEVICE_ID, NULL);
@@ -1506,7 +1548,6 @@ int dhdpcie_init(struct pci_dev *pdev)
 		bus->pcie_event.options = MSM_PCIE_CONFIG_NO_RECOVERY;
 		msm_pcie_register_event(&bus->pcie_event);
 		bus->no_cfg_restore = FALSE;
-		bus->no_bus_init = FALSE;
 #endif /* CONFIG_ARCH_MSM */
 #ifdef EXYNOS_PCIE_LINKDOWN_RECOVERY
 #if defined(CONFIG_SOC_EXYNOS8890) || defined(CONFIG_SOC_EXYNOS8895) || \
@@ -1659,14 +1700,12 @@ irqreturn_t
 dhdpcie_isr(int irq, void *arg)
 {
 	dhd_bus_t *bus = (dhd_bus_t*)arg;
-	int32 ret;
 	bus->isr_entry_time = OSL_SYSUPTIME_US();
-	ret = dhdpcie_bus_isr(bus);
+	if (!dhdpcie_bus_isr(bus)) {
+		DHD_LOG_MEM(("%s: dhdpcie_bus_isr returns with FALSE\n", __FUNCTION__));
+	}
 	bus->isr_exit_time = OSL_SYSUPTIME_US();
-	if (ret)
-		return TRUE;
-	else
-		return FALSE;
+	return IRQ_HANDLED;
 }
 
 int
@@ -1824,7 +1863,10 @@ dhdpcie_disable_device(dhd_bus_t *bus)
 		return BCME_ERROR;
 	}
 
-	pci_disable_device(bus->dev);
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 31))
+	if (pci_is_enabled(bus->dev))
+#endif // endif
+		pci_disable_device(bus->dev);
 
 	return 0;
 }
@@ -1873,6 +1915,15 @@ dhdpcie_enable_device(dhd_bus_t *bus)
 			DHD_ERROR(("%s: VID(0x%x) is different from saved VID(0x%x) "
 				"Skip the bus init\n", __FUNCTION__, vid, saved_vid));
 			bus->no_bus_init = TRUE;
+			/* Check if the PCIe link is down */
+			if (vid == (uint32)-1) {
+				bus->is_linkdown = 1;
+#ifdef SUPPORT_LINKDOWN_RECOVERY
+#ifdef CONFIG_ARCH_MSM
+				bus->no_cfg_restore = TRUE;
+#endif /* CONFIG_ARCH_MSM */
+#endif /* SUPPORT_LINKDOWN_RECOVERY */
+			}
 			return BCME_ERROR;
 		}
 	}

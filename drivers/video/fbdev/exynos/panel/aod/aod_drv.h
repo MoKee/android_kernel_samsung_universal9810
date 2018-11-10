@@ -42,7 +42,8 @@ enum AOD_SEQ {
 enum AOD_MAPTBL {
 	SELF_MASK_CTRL_MAPTBL = 0,
 	ANALOG_POS_MAPTBL,
-	CLOCK_CTRL_MAPTBL,
+	ANALOG_CLK_CTRL_MAPTBL,
+	DIGITAL_CLK_CTRL_MAPTBL,
 	DIGITAL_POS_MAPTBL,
 	DIGITAL_BLK_MAPTBL,
 	SET_TIME_MAPTBL,
@@ -59,6 +60,7 @@ struct aod_tune {
 	u32 nr_seqtbl;
 	struct maptbl *maptbl;
 	u32 nr_maptbl;
+	int self_mask_en;
 };
 
 struct clk_pos {

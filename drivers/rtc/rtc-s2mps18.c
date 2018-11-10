@@ -34,6 +34,17 @@
 #ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
 #include <linux/sec_debug.h>
 #endif
+#ifdef CONFIG_SEC_PM
+#include <linux/sec_sysfs.h>
+
+static struct device *pmic_rtc_dev;
+#endif /* CONFIG_SEC_PM */
+
+#ifdef CONFIG_SEC_PM_BIGDATA
+#include <linux/jiffies.h>
+#include <linux/workqueue.h>
+#include <linux/sec_hqm_device.h>
+#endif
 
 struct s2m_rtc_info {
 	struct device		*dev;
@@ -42,7 +53,7 @@ struct s2m_rtc_info {
 	struct s2mps18_dev	*iodev;
 	struct rtc_device	*rtc_dev;
 	struct mutex		lock;
-	struct work_struct	irq_work;
+	struct delayed_work	irq_work;
 	int			irq;
 #if defined(CONFIG_RTC_ALARM_BOOT)
 	int			alarm_boot_irq;
@@ -61,6 +72,9 @@ struct s2m_rtc_info {
 	u8			wudr_mask;
 	u8			audr_mask;
 	int			smpl_warn_info;
+#ifdef CONFIG_SEC_PM_BIGDATA
+	struct delayed_work hqm_spwc_work;
+#endif
 };
 
 static struct wakeup_source *rtc_ws;
@@ -713,6 +727,17 @@ static irqreturn_t s2m_rtc_alarm1_irq(int irq, void *data)
 }
 #endif
 
+#ifdef CONFIG_SEC_PM_BIGDATA
+void send_hqm_spwc_work(struct work_struct *work)
+{
+	hqm_device_info hqm_info;
+	char feature[HQM_FEATURE_LEN] ="SPWC";
+	 
+	memcpy(hqm_info.feature, feature, HQM_FEATURE_LEN);
+	send_uevent_via_hqm_device(hqm_info);
+}
+#endif
+
 extern unsigned int get_smpl_irq_num(void);
 
 static unsigned int smpl_irq;
@@ -727,26 +752,11 @@ static irqreturn_t s2m_smpl_warn_irq_handler(int irq, void *data)
 	if (gpio_get_value(info->smpl_warn_info) & 0x1)
 		return IRQ_HANDLED;
 
-	disable_irq_nosync(smpl_irq);
-
-	return IRQ_WAKE_THREAD;
-}
-
-static irqreturn_t s2m_smpl_warn_irq(int irq, void *data)
-{
-	struct s2m_rtc_info *info = data;
-	int state = 0;
-
-	if (!info->rtc_dev)
-		return IRQ_HANDLED;
-
-	do {
-		state = (gpio_get_value(info->smpl_warn_info) & 0x1);
-		msleep(100);
-	} while (!state);
-
 	dev_info(info->dev, "%s: SMPL_WARN HAPPENED!\n", __func__);
-	enable_irq(smpl_irq);
+
+	disable_irq_nosync(smpl_irq);
+	queue_delayed_work(system_freezable_wq, &info->irq_work,
+			msecs_to_jiffies(100));
 
 	return IRQ_HANDLED;
 }
@@ -754,23 +764,37 @@ static irqreturn_t s2m_smpl_warn_irq(int irq, void *data)
 #ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
 static unsigned long smpl_warn_number = 0;
 #endif
+#ifdef CONFIG_SEC_PM
+atomic_t smpl_warn_cnt = ATOMIC_INIT(0);
+#endif
 
 static void exynos_smpl_warn_work(struct work_struct *work)
 {
 	struct s2m_rtc_info *info = container_of(work,
-			struct s2m_rtc_info, irq_work);
+			struct s2m_rtc_info, irq_work.work);
 	int state = 0;
 
-	do {
-		state = (gpio_get_value(info->smpl_warn_info) & 0x1);
-		msleep(100);
-	} while (!state);
+	state = (gpio_get_value(info->smpl_warn_info) & 0x1);
+
+	if (!state) {
+		queue_delayed_work(system_freezable_wq, &info->irq_work,
+				msecs_to_jiffies(100));
+	} else {
+		dev_info(info->dev, "%s: SMPL_WARN polling End!\n", __func__);
+		enable_irq(smpl_irq);
 
 #ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-	smpl_warn_number++;
-	sec_debug_set_extra_info_smpl(smpl_warn_number);
+		smpl_warn_number++;
+		sec_debug_set_extra_info_smpl(smpl_warn_number);
 #endif
-	dev_info(info->dev, "%s: SMPL_WARN HAPPENED!\n", __func__);
+#ifdef CONFIG_SEC_PM
+		atomic_inc(&smpl_warn_cnt);
+#endif
+#ifdef CONFIG_SEC_PM_BIGDATA
+		cancel_delayed_work(&info->hqm_spwc_work);
+		schedule_delayed_work(&info->hqm_spwc_work, 5 * HZ);
+#endif
+	}
 }
 
 static void s2m_rtc_enable_wtsr_smpl(struct s2m_rtc_info *info,
@@ -917,6 +941,27 @@ static ssize_t show_rtc_status(struct device *dev,
 }
 
 static DEVICE_ATTR(rtc_status, 0440, show_rtc_status, NULL);
+
+static ssize_t smpl_warn_cnt_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	int cnt = atomic_read(&smpl_warn_cnt);
+
+	atomic_set(&smpl_warn_cnt, 0);
+
+	return sprintf(buf, "%d\n", cnt);
+}
+
+static DEVICE_ATTR_RO(smpl_warn_cnt);
+
+static struct attribute *pmic_rtc_attributes[] = {
+	&dev_attr_smpl_warn_cnt.attr,
+	NULL
+};
+
+static const struct attribute_group pmic_rtc_attr_group = {
+	.attrs = pmic_rtc_attributes,
+};
 #endif /* CONFIG_SEC_PM */
 
 static int s2m_rtc_probe(struct platform_device *pdev)
@@ -984,7 +1029,7 @@ static int s2m_rtc_probe(struct platform_device *pdev)
 
 		ret = devm_request_threaded_irq(&pdev->dev, info->smpl_irq,
 			s2m_smpl_warn_irq_handler,
-			s2m_smpl_warn_irq,
+			NULL,
 			IRQF_TRIGGER_LOW | IRQF_ONESHOT,
 			"SMPL WARN", info);
 		if (ret < 0) {
@@ -993,7 +1038,10 @@ static int s2m_rtc_probe(struct platform_device *pdev)
 			goto err_smpl_warn;
 		}
 		info->smpl_warn_info = pdata->smpl_warn;
-		INIT_WORK(&info->irq_work, exynos_smpl_warn_work);
+		INIT_DELAYED_WORK(&info->irq_work, exynos_smpl_warn_work);
+#ifdef CONFIG_SEC_PM_BIGDATA
+		INIT_DELAYED_WORK(&info->hqm_spwc_work, send_hqm_spwc_work);
+#endif
 	}
 
 	device_init_wakeup(&pdev->dev, true);
@@ -1026,6 +1074,12 @@ static int s2m_rtc_probe(struct platform_device *pdev)
 	if (ret)
 		dev_err(&pdev->dev, "%s: failed to create rtc_status(%d)\n",
 				__func__, ret);
+
+	pmic_rtc_dev = sec_device_create(NULL, "rtc");
+
+	ret = sysfs_create_group(&pmic_rtc_dev->kobj, &pmic_rtc_attr_group);
+	if (ret)
+		dev_err(&pdev->dev, "failed to create pmic_rtc sysfs group\n");
 #endif /* CONFIG_SEC_PM */
 
 #if defined(CONFIG_RTC_ALARM_BOOT)
@@ -1071,6 +1125,10 @@ static int s2m_rtc_remove(struct platform_device *pdev)
 #endif
 
 	wakeup_source_unregister(rtc_ws);
+
+#ifdef CONFIG_SEC_PM_BIGDATA
+	cancel_delayed_work(&info->hqm_spwc_work);
+#endif	
 
 	return 0;
 }

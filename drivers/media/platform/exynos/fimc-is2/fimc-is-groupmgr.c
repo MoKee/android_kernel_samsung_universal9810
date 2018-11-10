@@ -1960,7 +1960,10 @@ p_err:
 	return ret;
 }
 
-void set_group_shots(struct fimc_is_group *group, u32 hal_version, u32 framerate)
+static void set_group_shots(struct fimc_is_group *group,
+	u32 hal_version,
+	u32 framerate,
+	enum fimc_is_ex_mode ex_mode)
 {
 #ifdef ENABLE_IS_CORE
 	if (hal_version == IS_HAL_VER_3_2) {
@@ -2005,13 +2008,18 @@ void set_group_shots(struct fimc_is_group *group, u32 hal_version, u32 framerate
 		group->skip_shots = group->asyn_shots;
 	}
 #else
+	if (ex_mode == EX_DUALFPS_960 || ex_mode == EX_DUALFPS_480) {
+		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
+		group->sync_shots = MIN_OF_SYNC_SHOTS;
+	} else {
 #ifdef REDUCE_COMMAND_DELAY
-	group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
-	group->sync_shots = 0;
+		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
+		group->sync_shots = 0;
 #else
-	group->asyn_shots = MIN_OF_ASYNC_SHOTS;
-	group->sync_shots = MIN_OF_SYNC_SHOTS;
+		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 0;
+		group->sync_shots = MIN_OF_SYNC_SHOTS;
 #endif
+	}
 	group->init_shots = group->asyn_shots;
 	group->skip_shots = group->asyn_shots;
 #endif
@@ -2030,6 +2038,7 @@ int fimc_is_group_start(struct fimc_is_groupmgr *groupmgr,
 	u32 sensor_fcount;
 	u32 framerate;
 	u32 shot_inc;
+	enum fimc_is_ex_mode ex_mode;
 
 	FIMC_BUG(!groupmgr);
 	FIMC_BUG(!group);
@@ -2074,10 +2083,11 @@ int fimc_is_group_start(struct fimc_is_groupmgr *groupmgr,
 	} else {
 		sensor = device->sensor;
 		framerate = fimc_is_sensor_g_framerate(sensor);
+		ex_mode = fimc_is_sensor_g_ex_mode(sensor);
 
 		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
 			resourcemgr = device->resourcemgr;
-			set_group_shots(group, resourcemgr->hal_version, framerate);
+			set_group_shots(group, resourcemgr->hal_version, framerate, ex_mode);
 
 			/* frame count */
 			sensor_fcount = fimc_is_sensor_g_fcount(sensor) + 1;
@@ -2692,10 +2702,10 @@ static int fimc_is_group_check_pre(struct fimc_is_groupmgr *groupmgr,
 		fimc_is_gframe_group_head(group, &gframe);
 		if (unlikely(!gframe)) {
 			mgrerr("gframe is NULL1", device, group, frame);
-			fimc_is_stream_status(groupmgr, group_leader);
 			fimc_is_gframe_print_free(gframemgr);
 			fimc_is_gframe_print_group(group_leader);
 			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
+			fimc_is_stream_status(groupmgr, group_leader);
 			ret = -EINVAL;
 			goto p_err;
 		}
@@ -2723,10 +2733,10 @@ static int fimc_is_group_check_pre(struct fimc_is_groupmgr *groupmgr,
 		fimc_is_gframe_free_head(gframemgr, &gframe);
 		if (unlikely(!gframe)) {
 			mgerr("gframe is NULL2", device, group);
-			fimc_is_stream_status(groupmgr, group_leader);
 			fimc_is_gframe_print_free(gframemgr);
 			fimc_is_gframe_print_group(group_leader);
 			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
+			fimc_is_stream_status(groupmgr, group_leader);
 			group->fcount -= frame->num_buffers;
 			ret = -EINVAL;
 			goto p_err;
@@ -2756,10 +2766,10 @@ static int fimc_is_group_check_pre(struct fimc_is_groupmgr *groupmgr,
 		fimc_is_gframe_group_head(group, &gframe);
 		if (unlikely(!gframe)) {
 			mgrerr("gframe is NULL3", device, group, frame);
-			fimc_is_stream_status(groupmgr, group_leader);
 			fimc_is_gframe_print_free(gframemgr);
 			fimc_is_gframe_print_group(group_leader);
 			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
+			fimc_is_stream_status(groupmgr, group_leader);
 			ret = -EINVAL;
 			goto p_err;
 		}
@@ -2787,10 +2797,10 @@ static int fimc_is_group_check_pre(struct fimc_is_groupmgr *groupmgr,
 		fimc_is_gframe_free_head(gframemgr, &gframe);
 		if (unlikely(!gframe)) {
 			mgerr("gframe is NULL4", device, group);
-			fimc_is_stream_status(groupmgr, group_leader);
 			fimc_is_gframe_print_free(gframemgr);
 			fimc_is_gframe_print_group(group_leader);
 			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
+			fimc_is_stream_status(groupmgr, group_leader);
 			ret = -EINVAL;
 			goto p_err;
 		}
@@ -3010,15 +3020,6 @@ int fimc_is_group_shot(struct fimc_is_groupmgr *groupmgr,
 			frame->fcount = atomic_read(&group->sensor_fcount);
 		}
 		atomic_set(&group->backup_fcount, frame->fcount);
-
-		/* real automatic increase */
-		if (!try_sync_shot && (smp_shot_get(group) > MIN_OF_SYNC_SHOTS)) {
-			/* for multi-buffer */
-			if (frame->num_buffers)
-				atomic_add(frame->num_buffers, &group->sensor_fcount);
-			else
-				atomic_inc(&group->sensor_fcount);
-		}
 	} else {
 		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
 			/* for multi-buffer */

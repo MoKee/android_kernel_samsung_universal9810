@@ -136,6 +136,8 @@ static struct ufs_dev_fix ufs_fixups[] = {
                 UFS_DEVICE_QUIRK_PA_TACTIVATE),
         UFS_FIX(UFS_VENDOR_TOSHIBA, "THGLF2G9D8KBADG",
                 UFS_DEVICE_QUIRK_PA_TACTIVATE),
+        	UFS_FIX(UFS_VENDOR_TOSHIBA, "THGAF8G9T43BAIR",
+		UFS_DEVICE_QUIRK_SUPPORT_QUERY_FATAL_MODE),
         UFS_FIX(UFS_VENDOR_SKHYNIX, UFS_ANY_MODEL, UFS_DEVICE_NO_VCCQ),
 
         END_FIX
@@ -154,6 +156,7 @@ enum {
 	UFSHCD_STATE_ERROR,
 	UFSHCD_STATE_OPERATIONAL,
 	UFSHCD_STATE_EH_SCHEDULED,
+	UFSHCD_STATE_FATAL_MODE,
 };
 
 /* UFSHCD error handling flags */
@@ -209,15 +212,25 @@ static struct ufs_pm_lvl_states ufs_pm_lvl_states[] = {
 };
 
 #if defined(CONFIG_UFS_DATA_LOG)
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)
 #define	UFS_DATA_BUF_SIZE	8
-#define	UFS_DATA_LOG_MAX	512
+#endif
+#define UFS_CMDQ_DEPTH_MAX  32
+#define	UFS_DATA_LOG_MAX	1024
+
+static int queuing_req[UFS_CMDQ_DEPTH_MAX];
 
 struct ufs_data_log_summary {
+	u64 start_time;
 	u64	end_time;
 	sector_t	sector;
-	u64	*virt_addr;
 	int	segments_cnt;
+	int done;
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)
+	u64 *virt_addr;
 	char	datbuf[UFS_DATA_BUF_SIZE];
+#endif
+
 };
 
 static struct ufs_data_log_summary ufs_data_log[UFS_DATA_LOG_MAX] __cacheline_aligned;
@@ -1573,9 +1586,13 @@ static int ufshcd_map_sg(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 	int sector_offset = 0;
 
 #if defined(CONFIG_UFS_DATA_LOG)
-	void  *virt_sg_addr;
-	u8 opcode;
+	unsigned int dump_index;
+	int cpu = raw_smp_processor_id();
+	int id = 0;
+
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)
 	unsigned long  magicword[1];
+	void  *virt_sg_addr;
 	/*
 	 * 0x1F5E3A7069245CBE
 	 * 0x4977C72608FCE51F
@@ -1583,25 +1600,47 @@ static int ufshcd_map_sg(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 	 * 0x05D3D11A26CF3142
 	 */
 	magicword[0] = 0x1F5E3A7069245CBE;
-#if 0
-	magicword[1] = 0x4977C72608FCE51F;
-	magicword[2] = 0x524E74A9005F0D1B;
-	magicword[3] = 0x05D3D11A26CF3142;
 #endif
 #endif
+
 	cmd = lrbp->cmd;
+
 #if defined(CONFIG_UFS_DATA_LOG)
-	opcode = (u8)(*lrbp->cmd->cmnd);
-	if (opcode == READ_10) {
-		sg_segments = scsi_sg_count(cmd);
-		scsi_for_each_sg(cmd, sg, sg_segments, i) {
-		/*
-		 * Write magicword each memory location pointed  by SG element
-		 */
-			virt_sg_addr = sg_virt(sg);
-			memcpy(virt_sg_addr, magicword, 8);
+	if (cmd->request){
+		/*condition of data log*/
+		/*read request of system area for debugging dm verity issue*/
+		if ( rq_data_dir(cmd->request) == READ &&
+			cmd->request->__sector >= 68736 && cmd->request->__sector <= 1297535) {
+
+			for (id = 0; id < UFS_DATA_LOG_MAX; id++){
+				dump_index = atomic_inc_return(&hba->log_count) & (UFS_DATA_LOG_MAX - 1);
+				if (ufs_data_log[dump_index].done != 0xA)
+					break;
+			}
+			
+			if (id == UFS_DATA_LOG_MAX)
+				queuing_req[cmd->request->tag] = UFS_DATA_LOG_MAX - 1;
+			else
+				queuing_req[cmd->request->tag] = dump_index;
+
+			ufs_data_log[dump_index].done = 0xA;
+			ufs_data_log[dump_index].start_time = cpu_clock(cpu);
+			ufs_data_log[dump_index].end_time = 0;
+			ufs_data_log[dump_index].sector = cmd->request->__sector;
+
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)		
+			sg_segments = scsi_sg_count(cmd);
+			scsi_for_each_sg(cmd, sg, sg_segments, i) {
+				/*
+				 * Write magicword each memory location pointed  by SG element
+				 */
+				virt_sg_addr = sg_virt(sg);
+				ufs_data_log[dump_index].virt_addr = virt_sg_addr;
+				memcpy(virt_sg_addr, magicword, UFS_DATA_BUF_SIZE);
+			}
+#endif
+			}
 		}
-	}
 #endif
 
 	sg_segments = scsi_dma_map(cmd);
@@ -1808,6 +1847,12 @@ static void ufshcd_prepare_utp_query_req_upiu(struct ufs_hba *hba,
 	/* Copy the Descriptor */
 	if (query->request.upiu_req.opcode == UPIU_QUERY_OPCODE_WRITE_DESC)
 		memcpy(descp, query->descriptor, len);
+
+	if (query->request.query_func == UPIU_QUERY_FUNC_VENDOR_TOSHIBA_FATALMODE) {
+		ucd_req_ptr->header.dword_2 =
+			UPIU_HEADER_DWORD(0, 0, (len >> 8), (u8)len);
+		memcpy(descp, query->descriptor, len);
+	}
 
 	memset(lrbp->ucd_rsp_ptr, 0, sizeof(struct utp_upiu_rsp));
 }
@@ -2870,6 +2915,122 @@ static inline int ufshcd_read_unit_desc_param(struct ufs_hba *hba,
 
 	return ufshcd_read_desc_param(hba, QUERY_DESC_IDN_UNIT, lun,
 				      param_offset, param_read_buf, param_size);
+}
+
+static int __ufshcd_query_vendor_func(struct ufs_hba *hba,
+		u8 query_fn, enum query_opcode opcode, enum desc_idn idn, u8 index,
+		u8 selector, u8 *desc_buf, int *buf_len)
+{
+	struct ufs_query_req *request = NULL;
+	struct ufs_query_res *response = NULL;
+	int err;
+
+	BUG_ON(!hba);
+
+	pm_runtime_get_sync(hba->dev);
+	ufshcd_hold(hba, false);
+	if (!desc_buf) {
+		dev_err(hba->dev, "%s: descriptor buffer required for opcode 0x%x\n",
+				__func__, opcode);
+		err = -EINVAL;
+		goto out;
+	}
+
+	mutex_lock(&hba->dev_cmd.lock);
+
+	request = &hba->dev_cmd.query.request;
+	response = &hba->dev_cmd.query.response;
+	memset(request, 0, sizeof(struct ufs_query_req));
+	memset(response, 0, sizeof(struct ufs_query_res));
+
+	request->query_func = query_fn;
+
+	request->upiu_req.opcode = opcode;
+	request->upiu_req.idn = idn;
+	request->upiu_req.index = index;
+	request->upiu_req.selector = selector;
+
+	hba->dev_cmd.query.descriptor = desc_buf;
+	request->upiu_req.length = cpu_to_be16(*buf_len);
+
+	err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_QUERY, QUERY_REQ_TIMEOUT);
+
+	if (err) {
+		dev_err(hba->dev, "%s: opcode 0x%.2x for idn %d failed, index %d, err = %d\n",
+				__func__, opcode,
+				request->upiu_req.idn, index, err);
+		goto out_unlock;
+	}
+
+	hba->dev_cmd.query.descriptor = NULL;
+	*buf_len = be16_to_cpu(response->upiu_res.length);
+
+out_unlock:
+	mutex_unlock(&hba->dev_cmd.lock);
+out:
+	ufshcd_release(hba);
+	pm_runtime_put_sync(hba->dev);
+	return err;
+}
+
+/**
+ * ufshcd_vendor_specific_func - Vendor Specific Read/Write Functions
+ *
+ * @hba: pointer to adapter instance
+ * @buf: pointer to buffer where read/write function
+ * @size: size of buf
+ *
+ * Return 0 in case of success, non-zero otherwise
+ */
+int ufshcd_vendor_specific_func(struct ufs_hba *hba, u8 query_fn,
+		enum query_opcode opcode, enum desc_idn idn, u8 index, u8 selector,
+		u8 *buf, u32 *size)
+{
+	int err = 0;
+	int retries;
+
+	for (retries = QUERY_REQ_RETRIES; retries > 0; retries--) {
+		err = __ufshcd_query_vendor_func(hba, query_fn, opcode, idn, index,
+				selector, buf, size);
+		if (!err || err == -EINVAL)
+			break;
+
+		dev_dbg(hba->dev, "%s: error %d retrying\n", __func__, err);
+	}
+
+	if (err)
+		dev_err(hba->dev,
+				"%s is failed!! Query Function=0x%x err = %d\n",
+				__func__, query_fn, err);
+	else
+		dev_err(hba->dev,
+				"%s is OK!! Query Function=0x%x err = %d\n",
+				__func__, query_fn, err);
+
+	return err;
+}
+
+static int UFS_Toshiba_K2_query_fatal_mode(struct ufs_hba *hba)
+{
+	u8 dbuf[512] = {0, };
+	int dsize = sizeof(dbuf);
+	int result = 0;
+
+	/*enter fatal mode*/
+	dbuf[0] = 0x0C, dbuf[4] = 0xA2, dbuf[5] = 0xA0, dbuf[6] = 0x6A, dbuf[7] = 0x04;
+	result = ufshcd_vendor_specific_func(hba,
+			UPIU_QUERY_FUNC_VENDOR_TOSHIBA_FATALMODE,
+			0, 0, 0, 0, dbuf, &dsize);
+	if (result)
+		dev_err(hba->dev, "%s: failed to enter Toshiba K2 fatal mode. result = %d\n",
+				__func__, result);
+	else {
+		hba->UFS_fatal_mode_done = true;
+		dev_err(hba->dev, "%s: Success to enter Toshiba K2 fatal mode. result = %d\n",
+				__func__, result);
+	}
+
+	return result;
 }
 
 int ufshcd_read_health_desc(struct ufs_hba *hba, u8 *buf, u32 size)
@@ -4375,6 +4536,17 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 			scsi_status = result & MASK_SCSI_STATUS;
 			result = ufshcd_scsi_cmd_status(lrbp, scsi_status);
 
+			if (hba->dev_quirks & UFS_DEVICE_QUIRK_SUPPORT_QUERY_FATAL_MODE) {
+				if (scsi_status == SAM_STAT_CHECK_CONDITION) {
+					int sense_key = (0x0F & lrbp->sense_buffer[2]);
+
+					dev_err(hba->dev, "%s: CHECK CONDITION sense key = %d",
+							__func__, sense_key);
+					if ((sense_key == MEDIUM_ERROR) && !hba->UFS_fatal_mode_done)
+						schedule_work(&hba->fatal_mode_work);
+				}
+			}
+
 			/*
 			 * Currently we are only supporting BKOPs exception
 			 * events hence we can ignore BKOPs exception event
@@ -4463,10 +4635,11 @@ static void __ufshcd_transfer_req_compl(struct ufs_hba *hba, int reason,
 	int index;
 	struct request *req;
 #if defined(CONFIG_UFS_DATA_LOG)
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)
 	struct scatterlist *sg;
 	int sg_segments;
-	int i;
-	u8 opcode;
+#endif
+	int i = 0;
 	int cpu = raw_smp_processor_id();
 	unsigned int dump_index;
 #endif
@@ -4485,24 +4658,29 @@ static void __ufshcd_transfer_req_compl(struct ufs_hba *hba, int reason,
 			result = ufshcd_transfer_rsp_status(hba, lrbp);
 
 #if defined(CONFIG_UFS_DATA_LOG)
-			opcode = (u8)(*lrbp->cmd->cmnd);
-			/*
-			 * only for UFS READ operation
-			 */
-			if (opcode == READ_10) {
-				sg_segments = scsi_sg_count(cmd);
-				scsi_for_each_sg(cmd, sg, sg_segments, i) {
-					/*
-					 * Attempt to SG element for check magic word.
-					 * If magic word should have been overwritten in read case,
-					 * memory location will not be updated.
-					 */
-					dump_index = atomic_inc_return(&hba->log_count) & (UFS_DATA_LOG_MAX - 1);
+		if (cmd->request){
+			/*condition of data log*/
+			if (rq_data_dir(cmd->request) == READ&&
+				cmd->request->__sector >= 68736 && cmd->request->__sector <= 1297535) {
+					dump_index = queuing_req[cmd->request->tag];
+					queuing_req[cmd->request->tag] = 0;
 					ufs_data_log[dump_index].end_time = cpu_clock(cpu);
-					ufs_data_log[dump_index].sector = cmd->request->__sector;
-					ufs_data_log[dump_index].virt_addr = sg_virt(sg);
-					ufs_data_log[dump_index].segments_cnt = i;
-					memcpy(&ufs_data_log[dump_index].datbuf, sg_virt(sg), UFS_DATA_BUF_SIZE);
+					sg_segments = scsi_sg_count(cmd);
+					ufs_data_log[dump_index].segments_cnt = sg_segments;
+					ufs_data_log[dump_index].done = 0xF;
+
+#if defined(CONFIG_UFS_DATA_LOG_MAGIC_CODE)
+					scsi_for_each_sg(cmd, sg, sg_segments, i) {
+						/*
+						 * Attempt to SG element for check magic word.
+						 * If magic word should have been overwritten in read case,
+						 * memory location will not be updated.
+						 */
+						
+						ufs_data_log[dump_index].virt_addr = sg_virt(sg);
+						memcpy(&ufs_data_log[dump_index].datbuf, sg_virt(sg), UFS_DATA_BUF_SIZE);
+					}
+#endif
 				}
 			}
 #endif
@@ -4868,6 +5046,7 @@ static void ufshcd_exception_event_handler(struct work_struct *work)
 	hba = container_of(work, struct ufs_hba, eeh_work);
 
 	pm_runtime_get_sync(hba->dev);
+	scsi_block_requests(hba->host);
 	err = ufshcd_get_ee_status(hba, &status);
 	if (err) {
 		dev_err(hba->dev, "%s: failed to get exception status %d\n",
@@ -4881,6 +5060,7 @@ static void ufshcd_exception_event_handler(struct work_struct *work)
 		ufshcd_bkops_exception_event_handler(hba);
 
 out:
+	scsi_unblock_requests(hba->host);
 	pm_runtime_put_sync(hba->dev);
 	return;
 }
@@ -5107,6 +5287,23 @@ out:
 	scsi_unblock_requests(hba->host);
 	ufshcd_release(hba);
 	pm_runtime_put_sync(hba->dev);
+}
+
+static void ufshcd_fatal_mode_handler(struct work_struct *work)
+{
+	struct ufs_hba *hba;
+
+	hba = container_of(work, struct ufs_hba, fatal_mode_work);
+
+	scsi_block_requests(hba->host);
+	hba->ufshcd_state = UFSHCD_STATE_FATAL_MODE;
+
+	dev_err(hba->dev, "fatal mode %04x.\n", hba->manufacturer_id);
+	if (hba->manufacturer_id == UFS_VENDOR_TOSHIBA)
+		UFS_Toshiba_K2_query_fatal_mode(hba);
+
+	scsi_unblock_requests(hba->host);
+	return;
 }
 
 /**
@@ -5606,9 +5803,17 @@ clean:
 	wake_up(&hba->dev_cmd.tag_wq);
 
 out:
-	if (!err)
+	if (!err) {
 		err = SUCCESS;
-	else
+		if ((hba->dev_quirks & UFS_DEVICE_QUIRK_SUPPORT_QUERY_FATAL_MODE) &&
+				!hba->UFS_fatal_mode_done) {
+			unsigned long max_doorbells = (1UL << hba->nutrs) - 1;
+			if (hba->outstanding_reqs == max_doorbells)
+				__ufshcd_transfer_req_compl(hba, 0,
+						(1UL << (hba->nutrs - 1)));
+			schedule_work(&hba->fatal_mode_work);
+		}
+	} else
 		err = FAILED;
 
 	/*
@@ -7578,7 +7783,16 @@ static int ufshcd_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	int ret;
 	enum uic_link_state old_link_state;
 	enum ufs_pm_level pm_lvl;
+	unsigned long flags;
 	bool gating_allowed = !ufshcd_can_fake_clkgating(hba);
+
+	spin_lock_irqsave(hba->host->host_lock, flags);
+	if ((!hba->lrb_in_use) && (hba->clk_gating.active_reqs != 1)) {
+		dev_err(hba->dev, "%s: hba->clk_gating.active_reqs = %d\n",
+				__func__, hba->clk_gating.active_reqs);
+		hba->clk_gating.active_reqs = 1;
+	}
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
 	hba->pm_op_in_progress = 1;
 	if (ufshcd_is_system_pm(pm_op))
@@ -8090,6 +8304,16 @@ SEC_UFS_DATA_ATTR(SEC_UFS_err_sum, "\"OPERR\":\"%d\",\"UICCMD\":\"%d\",\"UICERR\
 UFS_DEV_ATTR(lt,  "%01x", hba->lifetime);
 UFS_DEV_ATTR(sense_err_count, "\"MEDIUM\":\"%d\",\"HWERR\":\"%d\"\n",
 						hba->host->medium_err_cnt, hba->host->hw_err_cnt);
+UFS_DEV_ATTR(sense_err_logging, "\"LBA0\":\"%lx\",\"LBA1\":\"%lx\",\"LBA2\":\"%lx\""
+		",\"LBA3\":\"%lx\",\"LBA4\":\"%lx\",\"LBA5\":\"%lx\""
+		",\"LBA6\":\"%lx\",\"LBA7\":\"%lx\",\"LBA8\":\"%lx\",\"LBA9\":\"%lx\""
+		",\"REGIONMAP\":\"%016llx\"\n",
+		hba->host->issue_LBA_list[0], hba->host->issue_LBA_list[1]
+		, hba->host->issue_LBA_list[2], hba->host->issue_LBA_list[3]
+		, hba->host->issue_LBA_list[4], hba->host->issue_LBA_list[5]
+		, hba->host->issue_LBA_list[6], hba->host->issue_LBA_list[7]
+		, hba->host->issue_LBA_list[8], hba->host->issue_LBA_list[9]
+		, hba->host->issue_region_map);
 
 static ssize_t ufs_lc_info_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -8119,6 +8343,7 @@ static struct attribute *ufs_attributes[] = {
 	&dev_attr_lt.attr,
 	&dev_attr_sense_err_count.attr,
 	&dev_attr_lc.attr,
+	&dev_attr_sense_err_logging.attr,
 #if defined(SEC_UFS_ERROR_COUNT)
 	&dev_attr_SEC_UFS_op_cnt.attr,
 	&dev_attr_SEC_UFS_uic_cmd_cnt.attr,
@@ -8126,7 +8351,6 @@ static struct attribute *ufs_attributes[] = {
 	&dev_attr_SEC_UFS_fatal_cnt.attr,
 	&dev_attr_SEC_UFS_utp_cnt.attr,
 	&dev_attr_SEC_UFS_query_cnt.attr,
-
 	&dev_attr_SEC_UFS_err_sum.attr,
 #endif
 	NULL
@@ -8432,6 +8656,7 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	/* Initialize work queues */
 	INIT_WORK(&hba->eh_work, ufshcd_err_handler);
 	INIT_WORK(&hba->eeh_work, ufshcd_exception_event_handler);
+	INIT_WORK(&hba->fatal_mode_work, ufshcd_fatal_mode_handler);
 
 	/* Initialize UIC command mutex */
 	mutex_init(&hba->uic_cmd_mutex);
